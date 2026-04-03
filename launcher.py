@@ -1,13 +1,37 @@
 """
 launcher.py – entry point for the packaged .exe
-Starts the Streamlit server, opens the browser, and adds a system tray icon
-with a Quit option to cleanly shut everything down.
+Single-instance guarded. Starts Streamlit, opens browser, adds system tray.
 """
 import sys
 import os
+
+# ── CRITICAL: must be the very first thing before any other imports ──────────
+# Prevents PyInstaller child processes from re-running main() on Windows.
+import multiprocessing
+multiprocessing.freeze_support()
+# ─────────────────────────────────────────────────────────────────────────────
+
+import socket
+import subprocess
 import threading
 import webbrowser
 import time
+import urllib.request
+
+
+# ── Single-instance lock via a bound socket ──────────────────────────────────
+_LOCK_PORT = 47200  # arbitrary port just for the lock
+
+def acquire_instance_lock():
+    """Returns a bound socket (lock) or None if another instance is running."""
+    lock_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    lock_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+    try:
+        lock_sock.bind(("127.0.0.1", _LOCK_PORT))
+        return lock_sock  # We are the first instance
+    except OSError:
+        return None  # Another instance already holds the lock
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def resource_path(relative_path):
@@ -16,51 +40,104 @@ def resource_path(relative_path):
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), relative_path)
 
 
-def open_browser():
-    time.sleep(4)
-    webbrowser.open("http://localhost:8501")
-
-
-def start_streamlit(app_script):
-    """Run Streamlit in a background thread."""
-    from streamlit.web import cli as stcli
-    sys.argv = ["streamlit", "run", app_script]
-    stcli.main()
-
-
-def main():
+def get_streamlit_cmd(app_script, port):
     if hasattr(sys, "_MEIPASS"):
-        os.chdir(os.path.dirname(sys.executable))
+        cmd = [sys.executable, "-m", "streamlit"]
+    else:
+        scripts_dir = os.path.dirname(sys.executable)
+        streamlit_exe = os.path.join(scripts_dir, "streamlit.exe")
+        cmd = [streamlit_exe] if os.path.exists(streamlit_exe) else [sys.executable, "-m", "streamlit"]
 
-    app_script = resource_path("automationtoolstreamlit19.py")
+    return cmd + [
+        "run", app_script,
+        "--server.port", port,
+        "--server.headless", "true",
+        "--browser.gatherUsageStats", "false",
+        "--global.developmentMode", "false",
+    ]
 
-    os.environ["STREAMLIT_SERVER_PORT"] = "8501"
+
+def wait_for_streamlit(url, timeout=90):
+    """Poll until Streamlit responds, then open the browser once."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            urllib.request.urlopen(url, timeout=2)
+            webbrowser.open(url)
+            return
+        except Exception:
+            time.sleep(1)
+    webbrowser.open(url)
+
+
+def run_streamlit_threaded(app_script, port):
+    """Fallback: run streamlit in-process if subprocess fails."""
+    os.environ["STREAMLIT_SERVER_PORT"] = port
     os.environ["STREAMLIT_SERVER_HEADLESS"] = "true"
     os.environ["STREAMLIT_BROWSER_GATHER_USAGE_STATS"] = "false"
     os.environ["STREAMLIT_GLOBAL_DEVELOPMENT_MODE"] = "false"
 
-    # Start Streamlit in background thread
-    t = threading.Thread(target=start_streamlit, args=(app_script,), daemon=True)
-    t.start()
+    def _run():
+        from streamlit.web import cli as stcli
+        sys.argv = ["streamlit", "run", app_script]
+        stcli.main()
 
-    # Open browser in background thread
-    threading.Thread(target=open_browser, daemon=True).start()
+    threading.Thread(target=_run, daemon=True).start()
 
-    # Run system tray on MAIN thread (required on Windows)
+
+def main():
+    # ── Guard: only one instance allowed ────────────────────────────────────
+    lock = acquire_instance_lock()
+    if lock is None:
+        # Another instance is already running — just focus its browser tab
+        webbrowser.open("http://localhost:8501")
+        sys.exit(0)
+    # ────────────────────────────────────────────────────────────────────────
+
+    if hasattr(sys, "_MEIPASS"):
+        os.chdir(os.path.dirname(sys.executable))
+
+    app_script = resource_path("automationtoolstreamlit19.py")
+    port = "8501"
+    url = f"http://localhost:{port}"
+
+    env = os.environ.copy()
+    if hasattr(sys, "_MEIPASS"):
+        env["PYTHONPATH"] = sys._MEIPASS
+
+    creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            get_streamlit_cmd(app_script, port),
+            creationflags=creationflags,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+        )
+    except Exception:
+        run_streamlit_threaded(app_script, port)
+
+    threading.Thread(target=wait_for_streamlit, args=(url,), daemon=True).start()
+
+    # ── System tray (main thread — required on Windows) ──────────────────────
     try:
         import pystray
         from PIL import Image, ImageDraw
 
-        # Create a simple green circle icon
         img = Image.new("RGB", (64, 64), color=(255, 255, 255))
         draw = ImageDraw.Draw(img)
         draw.ellipse([8, 8, 56, 56], fill=(46, 139, 87))
 
         def on_open(icon, item):
-            webbrowser.open("http://localhost:8501")
+            webbrowser.open(url)
 
         def on_quit(icon, item):
             icon.stop()
+            if proc:
+                proc.terminate()
+            lock.close()
             os._exit(0)
 
         menu = pystray.Menu(
@@ -69,11 +146,14 @@ def main():
         )
 
         icon = pystray.Icon("GEP Tool", img, "GEP Package Tool", menu)
-        icon.run()  # Blocks main thread — this is correct on Windows
+        icon.run()
 
-    except Exception as e:
-        # If tray fails, just wait for streamlit thread
-        t.join()
+    except Exception:
+        if proc:
+            proc.wait()
+        else:
+            while True:
+                time.sleep(1)
 
 
 if __name__ == "__main__":
